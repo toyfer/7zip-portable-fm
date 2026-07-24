@@ -1,0 +1,176 @@
+name: Build portable 7-Zip
+
+on:
+  schedule:
+    # Check upstream once a day (07:17 UTC)
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "7-Zip version (e.g. 26.02). Empty = latest upstream."
+        required: false
+        default: ""
+      force:
+        description: "Rebuild even if this version was already released"
+        type: boolean
+        required: false
+        default: false
+  repository_dispatch:
+    types: [build-portable]
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-portable
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve upstream version
+        id: ver
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version || github.event.client_payload.version || '' }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_VERSION}" ]; then
+            V="${INPUT_VERSION#v}"
+            echo "source=input" >> "$GITHUB_OUTPUT"
+          else
+            V=$(curl -fsSL -H "Accept: application/vnd.github+json" \
+              -H "User-Agent: 7zip-portable-fm-actions" \
+              https://api.github.com/repos/ip7z/7zip/releases/latest \
+              | python3 -c 'import sys,json; print(json.load(sys.stdin)["tag_name"].lstrip("v"))')
+            echo "source=upstream-latest" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=${V}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${V}" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: ${V}"
+
+      - name: Check existing release
+        id: exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          FORCE: ${{ github.event.inputs.force || github.event.client_payload.force || 'false' }}
+        run: |
+          set -euo pipefail
+          if [ "${FORCE}" = "true" ]; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Force rebuild enabled"
+            exit 0
+          fi
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release $TAG already exists — skipping build"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "No release $TAG yet — will build"
+          fi
+
+      - name: Set up Python
+        if: steps.exists.outputs.exists != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build portable package
+        if: steps.exists.outputs.exists != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          python3 scripts/build_portable.py \
+            --version "${{ steps.ver.outputs.version }}" \
+            --out-dir dist
+          ls -lah dist
+          cat dist/build-meta.json
+
+      - name: Upload artifact
+        if: steps.exists.outputs.exists != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: 7-Zip-Portable-${{ steps.ver.outputs.version }}
+          path: |
+            dist/7-Zip-Portable-*.zip
+            dist/7-Zip-Portable-*.zip.sha256
+            dist/build-meta.json
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: steps.exists.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          ZIP=$(ls dist/7-Zip-Portable-*.zip | head -1)
+          SHA_FILE=$(ls dist/7-Zip-Portable-*.zip.sha256 | head -1)
+          META=dist/build-meta.json
+          ZIP_SHA=$(python3 -c 'import json; print(json.load(open("dist/build-meta.json"))["zip_sha256"])')
+          UP_TAG=$(python3 -c 'import json; print(json.load(open("dist/build-meta.json"))["upstream_tag"])')
+
+          NOTES=$(cat <<EOF
+          ## 7-Zip Portable ${VERSION}
+
+          Unofficial portable repack of **official** [7-Zip ${VERSION}](https://github.com/ip7z/7zip/releases/tag/${UP_TAG}) Windows binaries.
+
+          ### Includes
+          - File Manager (\`7zFM.exe\`)
+          - Compress/extract GUI (\`7zG.exe\`)
+          - CLI (\`7z.exe\` + \`7z.dll\`)
+          - x64 / arm64 / x86
+          - \`standalone-7za/\` from official extra package
+
+          ### Does **not** include
+          - Registry / context menu integration
+          - \`Uninstall.exe\`
+          - Shell extension DLLs (\`7-zip.dll\`)
+
+          ### Usage
+          1. Extract ZIP
+          2. Run \`7-Zip.cmd\` (or \`x64\\7zFM.exe\`)
+
+          ### Checksums
+          \`\`\`
+          ${ZIP_SHA}  $(basename "$ZIP")
+          \`\`\`
+
+          Upstream: https://www.7-zip.org/  
+          Packaging only — not affiliated with Igor Pavlov / 7-Zip.org.
+          EOF
+          )
+
+          # Delete existing tag/release if force rebuilt
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release delete "$TAG" --repo "${{ github.repository }}" --yes --cleanup-tag || true
+          fi
+
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "7-Zip Portable ${VERSION}" \
+            --notes "$NOTES" \
+            "$ZIP" "$SHA_FILE" "$META"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Portable 7-Zip build"
+            echo ""
+            echo "- Version: \`${{ steps.ver.outputs.version }}\`"
+            echo "- Tag: \`${{ steps.ver.outputs.tag }}\`"
+            echo "- Already existed: \`${{ steps.exists.outputs.exists }}\`"
+            echo "- Source: \`${{ steps.ver.outputs.source }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
