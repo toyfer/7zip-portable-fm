@@ -120,8 +120,10 @@ jobs:
           META=dist/build-meta.json
           ZIP_SHA=$(python3 -c 'import json; print(json.load(open("dist/build-meta.json"))["zip_sha256"])')
           UP_TAG=$(python3 -c 'import json; print(json.load(open("dist/build-meta.json"))["upstream_tag"])')
+          ZIP_BASE=$(basename "$ZIP")
 
-          NOTES=$(cat <<EOF
+          NOTES_FILE=$(mktemp)
+          cat > "$NOTES_FILE" <<EOF
           ## 7-Zip Portable ${VERSION}
 
           Unofficial portable repack of **official** [7-Zip ${VERSION}](https://github.com/ip7z/7zip/releases/tag/${UP_TAG}) Windows binaries.
@@ -144,15 +146,21 @@ jobs:
 
           ### Checksums
           \`\`\`
-          ${ZIP_SHA}  $(basename "$ZIP")
+          ${ZIP_SHA}  ${ZIP_BASE}
           \`\`\`
 
-          Upstream: https://www.7-zip.org/  
+          Upstream: https://www.7-zip.org/
+
           Packaging only — not affiliated with Igor Pavlov / 7-Zip.org.
           EOF
-          )
+          # Strip common leading indent from the heredoc body
+          python3 - <<'PY' "$NOTES_FILE"
+          import sys, textwrap
+          path = sys.argv[1]
+          text = open(path, encoding="utf-8").read()
+          open(path, "w", encoding="utf-8").write(textwrap.dedent(text).lstrip())
+          PY
 
-          # Delete existing tag/release if force rebuilt
           if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             gh release delete "$TAG" --repo "${{ github.repository }}" --yes --cleanup-tag || true
           fi
@@ -160,7 +168,7 @@ jobs:
           gh release create "$TAG" \
             --repo "${{ github.repository }}" \
             --title "7-Zip Portable ${VERSION}" \
-            --notes "$NOTES" \
+            --notes-file "$NOTES_FILE" \
             "$ZIP" "$SHA_FILE" "$META"
 
       - name: Summary
