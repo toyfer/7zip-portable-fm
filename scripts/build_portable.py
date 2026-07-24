@@ -44,13 +44,36 @@ EXCLUDE_NAMES = {
     "7-zip32.dll",
 }
 
+CMD_HEADER = r"""@echo off
+setlocal
+set "DIR=%~dp0"
+if /i "%PROCESSOR_ARCHITECTURE%"=="ARM64" (
+  set "BIN=%DIR%arm64"
+) else if /i "%PROCESSOR_ARCHITEW6432%"=="ARM64" (
+  set "BIN=%DIR%arm64"
+) else if /i "%PROCESSOR_ARCHITECTURE%"=="AMD64" (
+  set "BIN=%DIR%x64"
+) else if /i "%PROCESSOR_ARCHITECTURE%"=="x86" (
+  if defined PROCESSOR_ARCHITEW6432 (
+    set "BIN=%DIR%x64"
+  ) else (
+    set "BIN=%DIR%x86"
+  )
+) else (
+  set "BIN=%DIR%x64"
+)
+"""
+
 
 def log(msg: str) -> None:
     print(msg, flush=True)
 
 
 def http_json(url: str) -> dict:
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/vnd.github+json"})
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": USER_AGENT, "Accept": "application/vnd.github+json"},
+    )
     with urllib.request.urlopen(req, timeout=120) as r:
         return json.load(r)
 
@@ -76,37 +99,19 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def version_to_tag_parts(version: str) -> tuple[str, str]:
-    """'26.02' -> ('26.02', '2602'); also accept '2602' or 'v26.02'."""
-    v = version.strip().lower().lstrip("v")
-    if re.fullmatch(r"\d+\.\d+", v):
-        major, minor = v.split(".")
-        compact = f"{int(major):02d}{int(minor):02d}" if False else f"{major}{minor.zfill(2) if len(minor) < 2 else minor}"
-        # 26.02 -> 2602, 9.20 -> 920 (upstream uses 7z920, 7z2602)
-        compact = major + minor.zfill(2) if len(minor) == 1 else major + minor
-        # special-case: upstream always concatenates without forcing major zfill
-        compact = f"{major}{minor}" if len(minor) >= 2 else f"{major}{minor.zfill(2)}"
-        return f"{major}.{minor}" if "." in v else v, compact.replace(".", "")
-    if re.fullmatch(r"\d{3,4}", v):
-        # 2602 -> 26.02 ; 920 -> 9.20
-        if len(v) == 4:
-            return f"{v[:2]}.{v[2:]}", v
-        if len(v) == 3:
-            return f"{v[0]}.{v[1:]}", v
-    raise ValueError(f"unrecognized version: {version!r}")
-
-
 def normalize_version(version: str) -> tuple[str, str, str]:
-    """Return (dotted, compact, release_tag). dotted=26.02 compact=2602 tag=26.02"""
+    """Return (dotted, compact, upstream_tag). Example: 26.02 -> 2602."""
     v = version.strip().lstrip("vV")
     if re.fullmatch(r"\d+\.\d+", v):
         major, minor = v.split(".")
         compact = f"{major}{minor}"
         return f"{major}.{minor}", compact, f"{major}.{minor}"
     if re.fullmatch(r"\d{4}", v):
-        return f"{v[:2]}.{v[2:]}", v, f"{v[:2]}.{v[2:]}"
+        dotted = f"{v[:2]}.{v[2:]}"
+        return dotted, v, dotted
     if re.fullmatch(r"\d{3}", v):
-        return f"{v[0]}.{v[1:]}", v, f"{v[0]}.{v[1:]}"
+        dotted = f"{v[0]}.{v[1:]}"
+        return dotted, v, dotted
     raise ValueError(f"unrecognized version: {version!r}")
 
 
@@ -144,9 +149,8 @@ def ensure_linux_7zz(work: Path) -> Path:
         return find_7zz(None)
     except FileNotFoundError:
         pass
-    # Try common org paths for recent builds; fall back via latest release linux asset if any
-    candidates = []
-    # Probe latest release assets for linux tarball
+
+    candidates: list[str] = []
     try:
         data = http_json(GITHUB_API)
         tag = data.get("tag_name", "")
@@ -154,16 +158,20 @@ def ensure_linux_7zz(work: Path) -> Path:
             n = a.get("name") or ""
             if "linux-x64" in n and n.endswith((".tar.xz", ".tar.gz")):
                 candidates.append(a["browser_download_url"])
-        dotted, compact, _ = normalize_version(tag)
+        _, compact, _ = normalize_version(tag)
         candidates.append(SEVENZIP_ORG_A.format(name=f"7z{compact}-linux-x64.tar.xz"))
     except Exception as e:
         log(f"warn: latest probe failed: {e}")
-    # Known recent fallbacks
-    for name in ("7z2602-linux-x64.tar.xz", "7z2601-linux-x64.tar.xz", "7z2501-linux-x64.tar.xz"):
+
+    for name in (
+        "7z2602-linux-x64.tar.xz",
+        "7z2601-linux-x64.tar.xz",
+        "7z2501-linux-x64.tar.xz",
+    ):
         candidates.append(SEVENZIP_ORG_A.format(name=name))
 
     tar_path = work / "7z-linux.tar.xz"
-    last_err = None
+    last_err: Exception | None = None
     for url in candidates:
         try:
             download(url, tar_path)
@@ -202,7 +210,6 @@ def copy_portable_arch(src: Path, dest: Path) -> None:
     lang = src / "Lang"
     if lang.is_dir():
         shutil.copytree(lang, dest / "Lang", dirs_exist_ok=True)
-    # Reject excluded if somehow present
     for p in list(dest.iterdir()):
         if p.name.lower() in EXCLUDE_NAMES or p.suffix.lower() == ".reg":
             p.unlink()
@@ -211,45 +218,26 @@ def copy_portable_arch(src: Path, dest: Path) -> None:
         shutil.copy2(dest / "7zFM.exe", dest / "7-Zip.exe")
     n = sum(1 for x in dest.rglob("*") if x.is_file())
     size = sum(x.stat().st_size for x in dest.rglob("*") if x.is_file())
-    log(f"{dest.name}: {n} files, {size/1024/1024:.2f} MB")
+    log(f"{dest.name}: {n} files, {size / 1024 / 1024:.2f} MB")
 
 
 def write_cmd(path: Path, exe_name: str, use_start: bool) -> None:
-    # Arch detection: ARM64 -> arm64, else AMD64/x64 -> x64, else x86
-    body = r'''@echo off
-setlocal
-set "DIR=%~dp0"
-if /i "%PROCESSOR_ARCHITECTURE%"=="ARM64" (
-  set "BIN=%DIR%arm64"
-) else if /i "%PROCESSOR_ARCHITEW6432%"=="ARM64" (
-  set "BIN=%DIR%arm64"
-) else if /i "%PROCESSOR_ARCHITECTURE%"=="AMD64" (
-  set "BIN=%DIR%x64"
-) else if /i "%PROCESSOR_ARCHITECTURE%"=="x86" (
-  if defined PROCESSOR_ARCHITEW6432 (
-    set "BIN=%DIR%x64"
-  ) else (
-    set "BIN=%DIR%x86"
-  )
-) else (
-  set "BIN=%DIR%x64"
-)
-if not exist "%BIN%\__EXE__" (
-  echo __EXE__ not found in "%BIN%"
-  exit /b 1
-)
-'''
-    body = body.replace("__EXE__", exe_name)
+    lines = [CMD_HEADER.rstrip("\n")]
+    lines.append(f'if not exist "%BIN%\\{exe_name}" (')
+    lines.append(f'  echo {exe_name} not found in "%BIN%"')
+    lines.append("  exit /b 1")
+    lines.append(")")
     if use_start:
-        body += f'start "" "%BIN%\\{exe_name}" %*\n'
+        lines.append(f'start "" "%BIN%\\{exe_name}" %*')
     else:
-        body += f'"%BIN%\\{exe_name}" %*\n'
-    path.write_text(body, encoding="utf-8", newline="\r\n")
+        lines.append(f'"%BIN%\\{exe_name}" %*')
+    lines.append("")
+    path.write_text("\r\n".join(lines), encoding="utf-8", newline="")
 
 
 def write_readme(path: Path, dotted: str, compact: str, hashes: dict[str, str]) -> None:
     lines_h = "\n".join(f"  {k}:\n  {v}" for k, v in hashes.items())
-    text = f'''7-Zip Portable {dotted} (no install / no registry)
+    text = f"""7-Zip Portable {dotted} (no install / no registry)
 ===================================================
 Built   : {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}
 Source  : Official installers (ip7z/7zip + 7-zip.org)
@@ -261,7 +249,7 @@ Official 7-Zip files only. NO registry, NO shell context menu, NO Uninstall.exe.
 Usage
 -----
 1. Extract this ZIP anywhere (USB OK)
-2. Double-click 7-Zip.cmd  → File Manager
+2. Double-click 7-Zip.cmd  -> File Manager
    or run x64\\7zFM.exe / arm64\\7zFM.exe / x86\\7zFM.exe
 3. In File Manager: Add (compress), Extract, Test
 4. CLI:  7z.cmd a archive.7z folder\\
@@ -286,13 +274,12 @@ Copyright
 Upstream installer SHA-256
 --------------------------
 {lines_h}
-'''
-    path.write_text(text, encoding="utf-8", newline="\r\n")
+"""
+    path.write_text(text.replace("\n", "\r\n"), encoding="utf-8", newline="")
 
 
 def pack_standalone(extra: Path, dest_root: Path) -> None:
     dest_root.mkdir(parents=True, exist_ok=True)
-    # x86 files live at extra root in official extra.7z
     x86_names = ["7za.exe", "7za.dll", "7zxa.dll"]
     if any((extra / n).is_file() for n in x86_names):
         d = dest_root / "x86"
@@ -314,28 +301,40 @@ def pack_standalone(extra: Path, dest_root: Path) -> None:
             shutil.copy2(extra / n, dest_root / n)
 
 
-def build(version: str | None, out_dir: Path, sevenzz: str | None, work: Path | None) -> Path:
+def build(
+    version: str | None,
+    out_dir: Path,
+    sevenzz: str | None,
+    work: Path | None,
+) -> Path:
     work_ctx = tempfile.TemporaryDirectory(prefix="7zport-") if work is None else None
-    work_path = Path(work) if work else Path(work_ctx.name)  # type: ignore[arg-type]
+    work_path = Path(work) if work else Path(work_ctx.name)  # type: ignore[union-attr]
     work_path.mkdir(parents=True, exist_ok=True)
 
     try:
         assets: list[dict] = []
         if version:
             dotted, compact, rel_tag = normalize_version(version)
-            # still fetch latest assets list if tag matches, else empty
             try:
                 data = http_json(GITHUB_API)
                 if normalize_version(data.get("tag_name", ""))[0] == dotted:
                     assets = data.get("assets") or []
             except Exception:
                 assets = []
+            # Also try the specific release endpoint for assets
+            if not assets:
+                try:
+                    data = http_json(
+                        f"https://api.github.com/repos/ip7z/7zip/releases/tags/{rel_tag}"
+                    )
+                    assets = data.get("assets") or []
+                except Exception:
+                    pass
         else:
             dotted, compact, rel_tag, assets = resolve_latest_version()
 
         log(f"Version: {dotted} (compact={compact}, tag={rel_tag})")
 
-        # Upstream release tag on ip7z/7zip is usually "26.02"
         up_tag = rel_tag
         names = {
             "x64": f"7z{compact}-x64.exe",
@@ -348,19 +347,19 @@ def build(version: str | None, out_dir: Path, sevenzz: str | None, work: Path | 
         ex_dir = work_path / "extract"
         hashes: dict[str, str] = {}
 
-        for key, name in names.items():
+        for name in names.values():
             url = asset_url(assets, name, up_tag)
             dest = dl_dir / name
             try:
                 download(url, dest)
             except Exception:
-                # fallback 7-zip.org
                 download(SEVENZIP_ORG_A.format(name=name), dest)
             hashes[name] = sha256_file(dest)
 
-        zz = Path(sevenzz) if sevenzz else ensure_linux_7zz(work_path / "linux7z")
         if sevenzz:
             zz = find_7zz(sevenzz)
+        else:
+            zz = ensure_linux_7zz(work_path / "linux7z")
 
         extract_archive(zz, dl_dir / names["x64"], ex_dir / "x64")
         extract_archive(zz, dl_dir / names["arm64"], ex_dir / "arm64")
@@ -382,14 +381,14 @@ def build(version: str | None, out_dir: Path, sevenzz: str | None, work: Path | 
         write_cmd(root / "7zG.cmd", "7zG.exe", use_start=False)
         write_readme(root / "README-PORTABLE.txt", dotted, compact, hashes)
 
-        # SHA256SUMS of package contents
         sum_lines = []
         for p in sorted(root.rglob("*")):
             if p.is_file():
                 sum_lines.append(f"{sha256_file(p)}  {p.relative_to(root).as_posix()}")
-        (root / "SHA256SUMS.txt").write_text("\n".join(sum_lines) + "\n", encoding="utf-8", newline="\r\n")
+        (root / "SHA256SUMS.txt").write_text(
+            "\r\n".join(sum_lines) + "\r\n", encoding="utf-8", newline=""
+        )
 
-        # Sanity: required binaries
         for arch in ("x64", "arm64", "x86"):
             for req in ("7zFM.exe", "7z.exe", "7z.dll", "7zG.exe"):
                 if not (root / arch / req).is_file():
@@ -402,18 +401,18 @@ def build(version: str | None, out_dir: Path, sevenzz: str | None, work: Path | 
         zip_path = out_dir / f"7-Zip-Portable-{dotted}.zip"
         if zip_path.exists():
             zip_path.unlink()
-        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+        with zipfile.ZipFile(
+            zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
+        ) as zf:
             for p in sorted(root.rglob("*")):
                 if p.is_file():
                     arc = Path(root.name) / p.relative_to(root)
                     zf.write(p, arcname=arc.as_posix())
 
-        # sidecar checksum for the zip itself
         zip_hash = sha256_file(zip_path)
         (out_dir / f"7-Zip-Portable-{dotted}.zip.sha256").write_text(
             f"{zip_hash}  {zip_path.name}\n", encoding="utf-8"
         )
-        # machine-readable metadata for Actions
         meta = {
             "version": dotted,
             "compact": compact,
@@ -424,7 +423,9 @@ def build(version: str | None, out_dir: Path, sevenzz: str | None, work: Path | 
             "upstream_sha256": hashes,
             "built_at": datetime.now(timezone.utc).isoformat(),
         }
-        (out_dir / "build-meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+        (out_dir / "build-meta.json").write_text(
+            json.dumps(meta, indent=2) + "\n", encoding="utf-8"
+        )
         log(f"OK {zip_path} ({zip_path.stat().st_size} bytes)")
         log(f"SHA256 {zip_hash}")
         return zip_path
@@ -435,11 +436,17 @@ def build(version: str | None, out_dir: Path, sevenzz: str | None, work: Path | 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--version", default=os.environ.get("SEVENZIP_VERSION") or None,
-                    help="7-Zip version e.g. 26.02 (default: latest upstream)")
+    ap.add_argument(
+        "--version",
+        default=os.environ.get("SEVENZIP_VERSION") or None,
+        help="7-Zip version e.g. 26.02 (default: latest upstream)",
+    )
     ap.add_argument("--out-dir", type=Path, default=Path("dist"))
-    ap.add_argument("--sevenzz", default=os.environ.get("SEVENZZ") or None,
-                    help="Path to 7zz binary")
+    ap.add_argument(
+        "--sevenzz",
+        default=os.environ.get("SEVENZZ") or None,
+        help="Path to 7zz binary",
+    )
     ap.add_argument("--work-dir", type=Path, default=None)
     args = ap.parse_args(argv)
     build(args.version, args.out_dir, args.sevenzz, args.work_dir)
